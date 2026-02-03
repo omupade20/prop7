@@ -1,5 +1,3 @@
-# strategy/decision_engine.py
-
 from dataclasses import dataclass
 from typing import Optional, Dict
 
@@ -12,22 +10,14 @@ from strategy.sr_levels import compute_sr_levels, get_nearest_sr, sr_location_sc
 from strategy.vwap_filter import VWAPContext
 
 
-# =========================
-# Output Structure
-# =========================
-
 @dataclass
 class DecisionResult:
-    state: str                 # IGNORE | PREPARE_LONG | PREPARE_SHORT | EXECUTE_LONG | EXECUTE_SHORT
-    score: float               # 0 – 10
+    state: str
+    score: float
     direction: Optional[str]
     components: Dict[str, float]
     reason: str
 
-
-# =========================
-# Decision Engine
-# =========================
 
 def final_trade_decision(
     inst_key: str,
@@ -41,77 +31,50 @@ def final_trade_decision(
     vwap_ctx: VWAPContext,
     breakout_signal: Optional[Dict],
 ) -> DecisionResult:
-
     components: Dict[str, float] = {}
     score = 0.0
 
-    # ==================================================
-    # 1️⃣ STRUCTURE GATE — NON-NEGOTIABLE
-    # ==================================================
-
-    if not breakout_signal:
-        return DecisionResult("IGNORE", 0.0, None, {}, "no breakout")
+    # 🚫 STRUCTURE GATE — REQUIRE BREAKOUT
+    if not breakout_signal or breakout_signal["signal"] != "CONFIRMED":
+        return DecisionResult("IGNORE", 0.0, None, {}, "no confirmed breakout")
 
     direction = breakout_signal["direction"]
-    signal_type = breakout_signal["signal"]
 
-    # POTENTIAL → NEVER EXECUTE
-    if signal_type == "POTENTIAL":
-        components["breakout"] = 1.0
-        return DecisionResult(
-            state=f"PREPARE_{direction}",
-            score=1.0,
-            direction=direction,
-            components=components,
-            reason="potential breakout"
-        )
-
-    # CONFIRMED breakout
-    components["breakout"] = 3.0
-    score += 3.0
-
-    # ==================================================
-    # 2️⃣ HTF & REGIME AUTHORITY
-    # ==================================================
-
-    # HTF must NOT oppose
+    # 🚫 HTF MUST ALIGN
     if direction == "LONG" and htf_bias_label.startswith("BEARISH"):
         return DecisionResult("IGNORE", 0.0, None, {}, "htf opposes long")
-
     if direction == "SHORT" and htf_bias_label.startswith("BULLISH"):
         return DecisionResult("IGNORE", 0.0, None, {}, "htf opposes short")
 
-    components["htf"] = 1.2
-    score += 1.2
-
-    # Regime filter
+    # 🚫 BAD MARKET REGIME STOP
     if market_regime in ("WEAK", "COMPRESSION"):
         return DecisionResult("IGNORE", 0.0, None, {}, "bad market regime")
 
+    # 📊 BREAKOUT BASE SCORE
+    components["breakout"] = 3.5
+    score += 3.5
+
+    # 🔥 TREND CONFIRMATION
+    components["htf"] = 1.5
+    score += 1.5
+
+    # 🧭 REGIME AUTHORITY
     if market_regime == "EARLY_TREND":
-        components["regime"] = 0.8
-        score += 0.8
+        components["regime"] = 1.0
+        score += 1.0
     elif market_regime == "TRENDING":
-        components["regime"] = 1.2
-        score += 1.2
+        components["regime"] = 1.5
+        score += 1.5
 
-    # ==================================================
-    # 3️⃣ VWAP ACCEPTANCE (ENVIRONMENT)
-    # ==================================================
-
+    # 📈 VWAP ENVIRONMENT CHECK (soft check)
     if direction == "LONG" and vwap_ctx.acceptance == "BELOW":
         return DecisionResult("IGNORE", 0.0, None, {}, "below VWAP")
-
     if direction == "SHORT" and vwap_ctx.acceptance == "ABOVE":
         return DecisionResult("IGNORE", 0.0, None, {}, "above VWAP")
-
     components["vwap"] = vwap_ctx.score
     score += vwap_ctx.score
 
-    # ==================================================
-    # 4️⃣ PARTICIPATION (VOLUME + VOLATILITY + LIQUIDITY)
-    # ==================================================
-
+    # 📊 PARTICIPATION: VOLUME + VOLATILITY + LIQUIDITY
     vol_ctx = analyze_volume(volumes, close_prices=closes)
     components["volume"] = vol_ctx.score
     score += vol_ctx.score
@@ -125,14 +88,10 @@ def final_trade_decision(
     liq_ctx = analyze_liquidity(volumes)
     if liq_ctx.score < 0:
         return DecisionResult("IGNORE", 0.0, None, {}, "illiquid")
-
     components["liquidity"] = liq_ctx.score
     score += liq_ctx.score
 
-    # ==================================================
-    # 5️⃣ TIMING (PA + SR + MOMENTUM)
-    # ==================================================
-
+    # 📌 PRICE ACTION CONTEXT
     pa_ctx = price_action_context(
         prices=closes,
         highs=highs,
@@ -145,35 +104,34 @@ def final_trade_decision(
     components["price_action"] = pa_ctx["score"]
     score += pa_ctx["score"]
 
+    # 📌 SUPPORT / RESISTANCE LOCATION
     sr_levels = compute_sr_levels(highs, lows)
     nearest = get_nearest_sr(closes[-1], sr_levels)
     sr_score = sr_location_score(closes[-1], nearest, direction)
     components["sr"] = sr_score
-    score += sr_score * 0.7
+    score += sr_score * 1.0  # slightly increased weight for precision
 
-    # Momentum sanity
+    # 🧠 MOMENTUM SANITY CHECK (RSI)
     rsi = relative_strength_index(prices, 14)
     if rsi:
-        if direction == "LONG" and rsi < 45:
-            score -= 0.5
-        elif direction == "SHORT" and rsi > 55:
-            score -= 0.5
+        if direction == "LONG" and rsi < 50:
+            score -= 0.6
+        elif direction == "SHORT" and rsi > 50:
+            score -= 0.6
 
-    # ==================================================
-    # 6️⃣ FINAL DECISION
-    # ==================================================
-
+    # 🟢 FINAL SCORE CLAMP
     score = round(max(min(score, 10.0), 0.0), 2)
 
-    if score >= 6.0:
+    # ⚖️ CALIBRATION FOR EXECUTE / PREPARE
+    if score >= 7.5:
         state = f"EXECUTE_{direction}"
-        reason = "high quality breakout"
-    elif score >= 3.5:
+        reason = "high conviction confirmed"
+    elif score >= 5.0:
         state = f"PREPARE_{direction}"
         reason = "setup forming"
     else:
         state = "IGNORE"
-        reason = "weak follow-through"
+        reason = "weak conviction"
 
     return DecisionResult(
         state=state,

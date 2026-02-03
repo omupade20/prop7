@@ -1,22 +1,17 @@
-# strategy/breakout_detector.py
-
 from typing import Optional, Dict
 from strategy.volume_filter import volume_spike_confirmed
 from strategy.volatility_filter import compute_atr
 
 
-# =========================
-# Compression Detection
-# =========================
+# ==================================================
+# 1️⃣ COMPRESSION DETECTION (UNCHANGED)
+# ==================================================
 
 def detect_compression(
     prices: list[float],
     lookback: int = 20,
     compression_ratio: float = 0.65
 ) -> bool:
-    """
-    Detect volatility contraction prior to expansion.
-    """
     if len(prices) < lookback * 2:
         return False
 
@@ -32,9 +27,9 @@ def detect_compression(
     return recent_range < previous_range * compression_ratio
 
 
-# =========================
-# Breakout / Intent Detector
-# =========================
+# ==================================================
+# 2️⃣ STRICT BREAKOUT / INTENT DETECTOR
+# ==================================================
 
 def breakout_signal(
     inst_key: str,
@@ -43,110 +38,110 @@ def breakout_signal(
     high_prices: Optional[list[float]] = None,
     low_prices: Optional[list[float]] = None,
     close_prices: Optional[list[float]] = None,
-    breakout_pct: float = 0.0015,
-    vol_threshold: float = 1.2,
-    atr_multiplier: float = 0.8
+    min_range_bars: int = 20,
+    min_break_pct_of_range: float = 0.08,   # 🔥 IMPORTANT
+    vol_threshold: float = 1.3,
+    atr_multiplier: float = 1.0
 ) -> Optional[Dict]:
     """
-    AUTHORITATIVE Breakout / Intent Detector.
-
-    Responsibilities:
-    - Detect REAL expansion intent
-    - Classify POTENTIAL vs CONFIRMED
-    - DO NOT decide direction by opinion
+    STRICT institutional breakout detector.
+    Produces VERY FEW but HIGH QUALITY signals.
     """
 
-    if len(prices) < 30:
+    if not prices or len(prices) < 40:
         return None
 
-    last_price = prices[-1]
-    prev_price = prices[-2]
+    last_close = close_prices[-1]
+    prev_close = close_prices[-2]
 
     # ---------------------
-    # Define Reference Range
+    # Reference Range (ONLY CLOSED BARS)
     # ---------------------
 
-    base = prices[-21:-1]   # last 20 completed bars
+    base = prices[-(min_range_bars + 1):-1]
     range_high = max(base)
     range_low = min(base)
     range_span = max(range_high - range_low, 1e-9)
 
     # ---------------------
-    # Direction ONLY from Range Break
+    # Direction (CLOSE BASED)
     # ---------------------
 
-    direction = None
-    if last_price > range_high:
+    if last_close > range_high:
         direction = "LONG"
-    elif last_price < range_low:
+        break_distance = last_close - range_high
+    elif last_close < range_low:
         direction = "SHORT"
+        break_distance = range_low - last_close
     else:
-        # no breakout, no intent
         return None
 
     # ---------------------
-    # Intent Components
+    # 🔥 MINIMUM BREAKOUT STRENGTH
     # ---------------------
 
-    components = {
-        "compression": 0.0,
-        "atr_expansion": 0.0,
-        "volume": 0.0
-    }
+    if break_distance / range_span < min_break_pct_of_range:
+        # weak poke → ignore
+        return None
 
-    # Compression (contextual, not mandatory)
-    if detect_compression(prices):
-        components["compression"] = 1.0
+    # ---------------------
+    # ATR CONFIRMATION (MANDATORY)
+    # ---------------------
 
-    # ATR Expansion (MANDATORY for CONFIRMED)
     atr_ok = False
     atr_val = None
     if high_prices and low_prices and close_prices:
         atr_val = compute_atr(high_prices, low_prices, close_prices, period=14)
-        if atr_val and abs(last_price - prev_price) >= atr_val * atr_multiplier:
+        if atr_val and abs(last_close - prev_close) >= atr_val * atr_multiplier:
             atr_ok = True
-            components["atr_expansion"] = 1.5
 
-    # Volume Participation (MANDATORY for CONFIRMED)
+    if not atr_ok:
+        return None
+
+    # ---------------------
+    # VOLUME CONFIRMATION (MANDATORY)
+    # ---------------------
+
     volume_ok = False
     if volume_history and len(volume_history) >= 20:
         if volume_spike_confirmed(volume_history, threshold_multiplier=vol_threshold):
             volume_ok = True
-            components["volume"] = 1.2
+
+    if not volume_ok:
+        return None
 
     # ---------------------
-    # Intent Score (informational only)
+    # COMPRESSION CONTEXT (BONUS ONLY)
     # ---------------------
 
-    intent_score = sum(components.values())
+    compression = detect_compression(prices)
 
     # ---------------------
-    # Classification Logic
+    # FOLLOW-THROUGH CHECK
     # ---------------------
 
-    signal = "POTENTIAL"
-    confirmed = False
+    follow_through = abs(last_close - prev_close) > 0.4 * range_span / min_range_bars
 
-    # CONFIRMED requires:
-    # - price outside range
-    # - ATR or Volume confirmation
-    if atr_ok or volume_ok:
-        signal = "CONFIRMED"
-        confirmed = True
+    # ---------------------
+    # FINAL CONFIRMED SIGNAL
+    # ---------------------
 
-    raw_flag = f"{signal}_{direction}"
+    intent_score = 3.0
+    if compression:
+        intent_score += 0.5
+    if follow_through:
+        intent_score += 0.5
 
     return {
-        "signal": signal,
+        "signal": "CONFIRMED",
         "direction": direction,
         "intent_score": round(intent_score, 2),
-        "components": components,
         "range_high": range_high,
         "range_low": range_low,
-        "last_price": last_price,
+        "range_span": round(range_span, 6),
+        "break_distance": round(break_distance, 6),
         "atr": round(atr_val, 6) if atr_val else None,
-        "atr_ok": atr_ok,
-        "volume_ok": volume_ok,
-        "raw_flag": raw_flag,
-        "reason": raw_flag
+        "compression": compression,
+        "follow_through": follow_through,
+        "reason": f"STRICT_CONFIRMED_{direction}"
     }
