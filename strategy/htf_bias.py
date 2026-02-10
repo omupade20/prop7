@@ -22,8 +22,8 @@ class HTFBias:
 def get_htf_bias(
     prices: List[float],
     vwap_value: Optional[float] = None,
-    short_period: int = 20,
-    long_period: int = 50,
+    short_period: int = 34,
+    long_period: int = 89,
     vwap_tolerance: float = 0.006
 ) -> HTFBias:
     """
