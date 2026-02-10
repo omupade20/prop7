@@ -119,8 +119,8 @@ def get_htf_bias(
     strength = max(0.5, min(round(strength, 2), 10.0))
 
     if direction == "BULLISH":
-        label = "BULLISH_STRONG" if strength >= 6.0 else "BULLISH_WEAK"
+        label = "BULLISH_STRONG" if strength >= 7.0 else "BULLISH_WEAK"
     else:
-        label = "BEARISH_STRONG" if strength >= 6.0 else "BEARISH_WEAK"
+        label = "BEARISH_STRONG" if strength >= 7.0 else "BEARISH_WEAK"
 
     return HTFBias(direction=direction, strength=strength, label=label, comment=" | ".join(comment_parts))
