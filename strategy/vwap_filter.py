@@ -1,40 +1,30 @@
-# strategy/vwap_filter.py
-
 from collections import deque
 from dataclasses import dataclass
 from typing import Optional
 
-# =========================
-# VWAP Context Output
-# =========================
 
 @dataclass
 class VWAPContext:
     vwap: Optional[float]
-    distance_pct: float             # price minus VWAP as percent
-    slope: float                    # VWAP slope over recent history
-    acceptance: str                 # ABOVE | BELOW | NEAR
-    pressure: str                   # BUYING | SELLING | NEUTRAL
-    score: float                    # -2 to +2 (for decision_engine scoring)
+    distance_pct: float
+    slope: float
+    acceptance: str         # ABOVE | BELOW | REJECTED | NEAR
+    pressure: str           # BUYING | SELLING | NEUTRAL
+    score: float            # -2 to +2
     comment: str
 
 
-# =========================
-# VWAP Calculator
-# =========================
-
 class VWAPCalculator:
     """
-    Intraday VWAP calculator + context.
+    STRICT Intraday VWAP Calculator.
 
-    Usage:
-      - reset() at session start
-      - update(price, volume) per tick or per bar
-      - get_vwap(): current VWAP
-      - get_context(price): returns VWAPContext with score
+    Upgrades:
+    - Wider acceptance threshold
+    - Penalizes magnet-zone trading
+    - Requires real slope confirmation
     """
 
-    def __init__(self, window: Optional[int] = None, slope_window: int = 5):
+    def __init__(self, window: Optional[int] = None, slope_window: int = 6):
         self.window = window
         self.slope_window = slope_window
 
@@ -50,9 +40,6 @@ class VWAPCalculator:
         self.reset()
 
     def reset(self):
-        """
-        Reset VWAP state at session start.
-        """
         self.price_volume_sum = 0.0
         self.volume_sum = 0.0
         self.vwap_history.clear()
@@ -62,21 +49,15 @@ class VWAPCalculator:
             self.volume_deque.clear()
 
     def update(self, price: float, volume: float) -> Optional[float]:
-        """
-        Update VWAP running sums with new price & volume.
-        If window is set, it rolls using deques.
-        """
         if price is None or volume is None or volume <= 0:
             return None
 
         if self.window:
             self.price_volume_deque.append(price * volume)
             self.volume_deque.append(volume)
-            # recompute sums from deques
             self.price_volume_sum = sum(self.price_volume_deque)
             self.volume_sum = sum(self.volume_deque)
         else:
-            # accumulate full session sums
             self.price_volume_sum += price * volume
             self.volume_sum += volume
 
@@ -88,32 +69,18 @@ class VWAPCalculator:
         return vwap
 
     def get_vwap(self) -> Optional[float]:
-        """
-        Return the latest VWAP (None if no volume yet).
-        """
         if self.volume_sum <= 0:
             return None
         return self.price_volume_sum / self.volume_sum
 
     # =========================
-    # VWAP Intelligence
+    # STRICT VWAP INTELLIGENCE
     # =========================
 
     def get_context(self, price: float) -> VWAPContext:
-        """
-        Return a VWAPContext object for the given price.
-        VWAPContext includes:
-          - vwap: current VWAP
-          - distance_pct: (price - vwap) / vwap * 100
-          - slope: recent VWAP slope
-          - acceptance: ABOVE/BELOW/NEAR
-          - pressure: BUYING/SELLING/NEUTRAL
-          - score: numeric score (-2..+2) for decision_engine
-          - comment: text of interpretation
-        """
+
         vwap = self.get_vwap()
 
-        # no VWAP available
         if vwap is None or price is None:
             return VWAPContext(
                 vwap=None,
@@ -122,46 +89,61 @@ class VWAPCalculator:
                 acceptance="NEAR",
                 pressure="NEUTRAL",
                 score=0.0,
-                comment="VWAP not available"
+                comment="VWAP unavailable"
             )
 
-        # distance from VWAP in percent
         distance_pct = (price - vwap) / vwap * 100.0
 
-        # slope over recent history
+        # slope strength
         if len(self.vwap_history) >= 2:
             slope = self.vwap_history[-1] - self.vwap_history[0]
         else:
             slope = 0.0
 
-        # classify acceptance zone
-        if distance_pct > 0.2:  # price > 0.2% above VWAP
+        # ----------------------------
+        # STRONGER ACCEPTANCE ZONES
+        # ----------------------------
+
+        if distance_pct > 0.35:
             acceptance = "ABOVE"
-        elif distance_pct < -0.2:
+        elif distance_pct < -0.35:
             acceptance = "BELOW"
         else:
             acceptance = "NEAR"
 
-        # pressure interpretation
+        # ----------------------------
+        # PRESSURE LOGIC (STRICT)
+        # ----------------------------
+
+        score = 0.0
+        pressure = "NEUTRAL"
+        comment = ""
+
+        # Strong bullish continuation
         if acceptance == "ABOVE" and slope > 0:
             pressure = "BUYING"
-            score = 1.5
-            comment = "Accepted above VWAP with rising slope"
+            score = 1.8
+            comment = "strong_acceptance_above_vwap"
+
+        # Strong bearish continuation
         elif acceptance == "BELOW" and slope < 0:
             pressure = "SELLING"
-            score = -1.5
-            comment = "Accepted below VWAP with falling slope"
-        elif acceptance == "NEAR":
+            score = -1.8
+            comment = "strong_acceptance_below_vwap"
+
+        # Weak alignment (distance ok but slope weak)
+        elif acceptance in ("ABOVE", "BELOW"):
             pressure = "NEUTRAL"
-            score = 0.0
-            comment = "Near VWAP (magnet zone)"
+            score = -0.8
+            comment = "distance_without_slope"
+
+        # Magnet zone (very dangerous area)
         else:
             pressure = "NEUTRAL"
-            # slight penalty when price is above but slope falling, or below but slope rising
-            score = -0.5
-            comment = "VWAP uncertainty or weak pressure"
+            score = -1.0
+            comment = "near_vwap_magnet_zone"
 
-        # clamp score
+        # Clamp
         score = max(min(score, 2.0), -2.0)
 
         return VWAPContext(
