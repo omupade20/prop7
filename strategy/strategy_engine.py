@@ -1,4 +1,4 @@
-# strategy/strategy_engine.py
+from datetime import datetime
 
 from strategy.market_regime import detect_market_regime
 from strategy.htf_bias import get_htf_bias
@@ -12,11 +12,15 @@ from strategy.mtf_context import analyze_mtf
 
 class StrategyEngine:
     """
-    PROFESSIONAL PULLBACK-BASED STRATEGY ENGINE
+    STRICT INSTITUTIONAL PULLBACK STRATEGY
 
-    New Hierarchy:
-
-    MTF → Regime → HTF → VWAP → PULLBACK DETECTION → Decision Engine
+    Hierarchy:
+    MTF (strong) →
+    Regime (TRENDING only) →
+    HTF alignment →
+    VWAP structure →
+    Pullback →
+    Decision engine
     """
 
     def __init__(self, scanner, vwap_calculators):
@@ -27,10 +31,24 @@ class StrategyEngine:
     def evaluate(self, inst_key: str, ltp: float):
 
         # ==================================================
+        # 0️⃣ TIME FILTER (ANTI-CHOP PROTECTION)
+        # ==================================================
+
+        now = datetime.now()
+
+        # Avoid first 15 minutes
+        if now.hour == 9 and now.minute < 30:
+            return None
+
+        # Reduce mid-day chop entries
+        if 12 <= now.hour <= 13:
+            return None
+
+        # ==================================================
         # 1️⃣ DATA SUFFICIENCY
         # ==================================================
 
-        if not self.scanner.has_enough_data(inst_key, min_bars=40):
+        if not self.scanner.has_enough_data(inst_key, min_bars=60):
             return None
 
         prices = self.scanner.get_prices(inst_key)
@@ -75,15 +93,21 @@ class StrategyEngine:
             history_15m=hist_15m
         )
 
-        # HARD GATE: need clear HTF direction
+        # 🔒 Must have strong directional conviction
         if mtf_ctx.direction == "NEUTRAL":
             return None
 
         if mtf_ctx.conflict:
             return None
 
+        if mtf_ctx.confidence == "LOW":
+            return None
+
+        if mtf_ctx.strength < 1.0:
+            return None
+
         # ==================================================
-        # 3️⃣ MARKET REGIME FILTER
+        # 3️⃣ MARKET REGIME (TRENDING ONLY)
         # ==================================================
 
         regime = detect_market_regime(
@@ -92,7 +116,7 @@ class StrategyEngine:
             closes=closes
         )
 
-        if regime.state in ("WEAK", "COMPRESSION"):
+        if regime.state != "TRENDING":
             return None
 
         # ==================================================
@@ -112,7 +136,7 @@ class StrategyEngine:
         vwap_ctx = vwap_calc.get_context(ltp)
 
         # ==================================================
-        # 5️⃣ HTF BIAS
+        # 5️⃣ HTF BIAS ALIGNMENT
         # ==================================================
 
         htf_bias = get_htf_bias(
@@ -120,15 +144,18 @@ class StrategyEngine:
             vwap_value=vwap_ctx.vwap
         )
 
-        # HTF must align with MTF
         if mtf_ctx.direction == "BULLISH" and htf_bias.direction != "BULLISH":
             return None
 
         if mtf_ctx.direction == "BEARISH" and htf_bias.direction != "BEARISH":
             return None
 
+        # Require minimum HTF strength
+        if htf_bias.strength < 3.0:
+            return None
+
         # ==================================================
-        # 6️⃣ PULLBACK DETECTION (CORE CHANGE)
+        # 6️⃣ PULLBACK DETECTION
         # ==================================================
 
         pullback = detect_pullback_signal(
@@ -144,7 +171,7 @@ class StrategyEngine:
             return None
 
         # ==================================================
-        # 7️⃣ FINAL DECISION ENGINE
+        # 7️⃣ FINAL DECISION
         # ==================================================
 
         decision = final_trade_decision(
@@ -160,9 +187,9 @@ class StrategyEngine:
             pullback_signal=pullback
         )
 
-        # Add debugging context
         decision.components["mtf_direction"] = mtf_ctx.direction
         decision.components["mtf_strength"] = mtf_ctx.strength
+        decision.components["mtf_confidence"] = mtf_ctx.confidence
         decision.components["regime"] = regime.state
         decision.components["htf_bias"] = htf_bias.label
 
