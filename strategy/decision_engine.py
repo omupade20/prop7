@@ -180,11 +180,11 @@ def final_trade_decision(
 
     score = round(max(min(score, 10.0), 0.0), 2)
 
-    if score >= 7.8:
+    if score >= 8.8:
         state = f"EXECUTE_{direction}"
         reason = "high quality pullback trade"
 
-    elif score >= 5.5:
+    elif score >= 6.5:
         state = f"PREPARE_{direction}"
         reason = "developing pullback setup"
 
