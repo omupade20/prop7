@@ -1,205 +1,230 @@
 # strategy/sr_levels.py
 """
-Institutional Intraday Support & Resistance (v2)
+Support & Resistance utilities (tuned for intraday precision).
 
-Upgrades applied over v1:
-- Uses highs, lows, closes together
-- Volume-weighted pivot clustering
-- ATR-scaled clustering tolerance
-- Recency decay weighting
-- Strength-based level selection
-- Optional VWAP & HTF level merge hooks
-
-Designed for 1-minute intraday data.
+Improvements applied:
+- Larger lookback for stability
+- Tighter clustering tolerance
+- Stricter proximity zones
+- Fewer but higher-quality SR levels
 """
 
 from typing import List, Dict, Optional, Tuple
 from statistics import mean
-import math
 
 
-# =========================
-# Helpers
-# =========================
+def compute_simple_sr(highs: List[float], lows: List[float], lookback: int = 180) -> Dict[str, float]:
+    """
+    Simple fallback SR: max(highs) and min(lows) over lookback.
+    """
+    highs = highs[-lookback:] if highs else []
+    lows = lows[-lookback:] if lows else []
 
-def _true_range(h: float, l: float, prev_c: float) -> float:
-    return max(h - l, abs(h - prev_c), abs(l - prev_c))
+    if not highs or not lows:
+        return {"support": None, "resistance": None}
 
-
-def compute_atr(highs: List[float], lows: List[float], closes: List[float], period: int = 14) -> float:
-    if len(highs) < period + 1:
-        return 0.0
-
-    trs = []
-    for i in range(1, len(highs)):
-        trs.append(_true_range(highs[i], lows[i], closes[i - 1]))
-
-    return sum(trs[-period:]) / period
+    return {
+        "support": min(lows),
+        "resistance": max(highs)
+    }
 
 
-# =========================
-# Pivot Detection
-# =========================
-
-def _find_local_extrema(values: List[float], window: int = 7) -> List[Tuple[int, float]]:
+def _find_local_extrema(values: List[float], window: int = 7) -> Tuple[List[Tuple[int, float]], List[Tuple[int, float]]]:
+    """
+    Find approximate local maxima (resistances) and minima (supports).
+    Slightly larger window for cleaner zones.
+    """
     n = len(values)
-    extrema = []
+    maxima, minima = [], []
 
     if n < window * 2 + 1:
-        return extrema
+        return maxima, minima
 
     half = window // 2
 
     for i in range(half, n - half):
-        c = values[i]
+        center = values[i]
         left = values[i - half:i]
         right = values[i + 1:i + 1 + half]
 
-        if all(c >= x for x in left + right) or all(c <= x for x in left + right):
-            extrema.append((i, c))
+        if all(center > x for x in left + right):
+            maxima.append((i, center))
 
-    return extrema
+        if all(center < x for x in left + right):
+            minima.append((i, center))
+
+    return maxima, minima
 
 
-# =========================
-# Volume + Recency Weighted Clustering
-# =========================
-
-def _cluster_levels_weighted(
-    pivots: List[Tuple[int, float]],
-    volumes: List[float],
-    atr: float,
-    atr_mult: float = 0.6,
-    decay: float = 0.995
-) -> List[Dict]:
+def _cluster_levels(peaks: List[float], tol_pct: float = 0.0035) -> List[Dict]:
     """
-    Cluster pivots using ATR-scaled tolerance.
-    Weight by volume and recency.
+    Cluster numeric peaks into clean SR levels.
+    Tighter tolerance (0.35%) for intraday precision.
     """
-
-    if not pivots:
+    if not peaks:
         return []
 
-    tol = max(atr * atr_mult, 1e-9)
-
+    sorted_peaks = sorted(peaks)
     clusters = []
+    cluster = [sorted_peaks[0]]
 
-    for idx, price in pivots:
-        vol = volumes[idx] if idx < len(volumes) else 1.0
-        weight = vol * (decay ** (len(volumes) - idx))
+    for p in sorted_peaks[1:]:
+        avg = sum(cluster) / len(cluster)
+        tol = avg * tol_pct
 
-        placed = False
-        for c in clusters:
-            if abs(price - c["mean"]) <= tol:
-                c["prices"].append(price)
-                c["weights"].append(weight)
-                c["mean"] = sum(p * w for p, w in zip(c["prices"], c["weights"])) / sum(c["weights"])
-                placed = True
-                break
+        if abs(p - avg) <= tol:
+            cluster.append(p)
+        else:
+            clusters.append(cluster)
+            cluster = [p]
 
-        if not placed:
-            clusters.append({
-                "prices": [price],
-                "weights": [weight],
-                "mean": price
-            })
+    clusters.append(cluster)
 
     out = []
     for c in clusters:
-        strength = sum(c["weights"])
+        lvl = mean(c)
         out.append({
-            "level": round(c["mean"], 6),
-            "strength": strength,
-            "touches": len(c["prices"])
+            "level": round(lvl, 6),
+            "count": len(c),
+            "strength": min(len(c), 4)   # cap strength for stability
         })
 
     return out
 
 
-# =========================
-# Main SR Computation
-# =========================
-
 def compute_sr_levels(
     highs: List[float],
     lows: List[float],
-    closes: List[float],
-    volumes: List[float],
     lookback: int = 360,
     extrema_window: int = 7,
-    max_levels: int = 4,
-    atr_period: int = 14
+    cluster_tol_pct: float = 0.0035,
+    max_levels: int = 3
 ) -> Dict[str, List[Dict]]:
     """
-    Institutional SR detection.
+    Compute high-quality SR levels with stricter settings.
+
+    Changes:
+    - lookback 360 (6 hours of 1m bars)
+    - extrema_window 7 (cleaner pivots)
+    - tighter clustering
+    - max 3 key levels only
     """
+    highs_s = highs[-lookback:] if highs else []
+    lows_s = lows[-lookback:] if lows else []
 
-    highs = highs[-lookback:]
-    lows = lows[-lookback:]
-    closes = closes[-lookback:]
-    volumes = volumes[-lookback:]
+    if not highs_s or not lows_s:
+        return {"supports": [], "resistances": []}
 
-    if not highs or not lows or not closes:
-        return {"levels": []}
+    max_extrema, _ = _find_local_extrema(highs_s, window=extrema_window)
+    _, min_extrema = _find_local_extrema(lows_s, window=extrema_window)
 
-    atr = compute_atr(highs, lows, closes, atr_period)
+    resistances = [val for _, val in max_extrema]
+    supports = [val for _, val in min_extrema]
 
-    values = []
-    for h, l, c in zip(highs, lows, closes):
-        values.append(h)
-        values.append(l)
-        values.append(c)
+    resist_clusters = _cluster_levels(resistances, tol_pct=cluster_tol_pct)
+    supp_clusters = _cluster_levels(supports, tol_pct=cluster_tol_pct)
 
-    pivots = _find_local_extrema(values, window=extrema_window)
+    supp_clusters_sorted = sorted(supp_clusters, key=lambda x: x["level"])[:max_levels]
+    res_clusters_sorted = sorted(resist_clusters, key=lambda x: x["level"], reverse=True)[:max_levels]
 
-    clusters = _cluster_levels_weighted(pivots, volumes * 3, atr)
-
-    clusters_sorted = sorted(clusters, key=lambda x: x["strength"], reverse=True)[:max_levels]
-
-    return {"levels": clusters_sorted}
+    return {
+        "supports": supp_clusters_sorted,
+        "resistances": res_clusters_sorted
+    }
 
 
-# =========================
-# Nearest SR
-# =========================
-
-def get_nearest_sr(price: float, sr: Dict[str, List[Dict]], max_dist_atr: float = 1.5, atr: float = 0.0) -> Optional[Dict]:
-    if not sr or "levels" not in sr:
+def get_nearest_sr(
+    price: float,
+    sr_levels: Dict[str, List[Dict]],
+    max_search_pct: float = 0.025
+) -> Optional[Dict]:
+    """
+    Find nearest SR but only within 2.5% of price.
+    Much stricter than earlier 5%.
+    """
+    if not sr_levels:
         return None
+
+    supports = sr_levels.get("supports", [])
+    resistances = sr_levels.get("resistances", [])
 
     best = None
     best_dist = float("inf")
 
-    for lvl in sr["levels"]:
-        d = abs(price - lvl["level"])
-        if d < best_dist:
-            best_dist = d
-            best = lvl
+    for s in supports:
+        lvl = s["level"]
+        dist = abs(price - lvl) / max(lvl, 1e-9)
 
-    if atr > 0 and best_dist > atr * max_dist_atr:
-        return None
+        if dist < best_dist:
+            best_dist = dist
+            best = {
+                "type": "support",
+                "level": lvl,
+                "dist_pct": dist,
+                "strength": s.get("strength", 1)
+            }
 
-    return best
+    for r in resistances:
+        lvl = r["level"]
+        dist = abs(lvl - price) / max(price, 1e-9)
+
+        if dist < best_dist:
+            best_dist = dist
+            best = {
+                "type": "resistance",
+                "level": lvl,
+                "dist_pct": dist,
+                "strength": r.get("strength", 1)
+            }
+
+    if best and best["dist_pct"] <= max_search_pct:
+        return best
+
+    return None
 
 
-# =========================
-# Location Score
-# =========================
-
-def sr_location_score(price: float, nearest: Optional[Dict], atr: float, direction: str) -> float:
-    if nearest is None or atr <= 0:
+def sr_location_score(
+    price: float,
+    nearest_sr: Optional[Dict],
+    direction: str,
+    proximity_threshold: float = 0.02
+) -> float:
+    """
+    Much stricter location scoring:
+    - Only within 2% of SR does it matter
+    - Stronger penalty when far from SR
+    """
+    if nearest_sr is None:
         return 0.0
 
-    dist = abs(price - nearest["level"])
-    closeness = max(0.0, 1.0 - (dist / (atr * 1.5)))
+    dist = nearest_sr.get("dist_pct", None)
+    if dist is None or dist > proximity_threshold:
+        return 0.0
 
-    strength = min(2.0, math.log1p(nearest.get("strength", 1.0)))
+    closeness = max(0.0, (proximity_threshold - dist) / (proximity_threshold + 1e-9))
+
+    strength = float(nearest_sr.get("strength", 1))
+    strength_factor = min(1.5, 0.6 + 0.2 * strength)
 
     sign = 0
-    if direction == "LONG":
-        sign = 1 if price >= nearest["level"] else -1
-    elif direction == "SHORT":
-        sign = 1 if price <= nearest["level"] else -1
+    typ = nearest_sr.get("type")
 
-    score = sign * closeness * strength
-    return max(-1.0, min(1.0, round(score, 3)))
+    if direction == "LONG":
+        if typ == "support":
+            sign = 1
+        elif typ == "resistance":
+            sign = -1
+    elif direction == "SHORT":
+        if typ == "resistance":
+            sign = 1
+        elif typ == "support":
+            sign = -1
+
+    score = sign * closeness * strength_factor
+
+    if score > 1.0:
+        score = 1.0
+    if score < -1.0:
+        score = -1.0
+
+    return round(score, 3)
