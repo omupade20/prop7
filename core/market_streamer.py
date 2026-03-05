@@ -18,12 +18,17 @@ from execution.trade_logger import TradeLogger
 
 FEED_MODE = "full"
 
+
 # ---------------- LOAD UNIVERSE ----------------
 with open("data/nifty500_keys.json", "r") as f:
     INSTRUMENT_LIST = json.load(f)
 
+
 # ---------------- CORE OBJECTS ----------------
-scanner = MarketScanner(max_len=600)
+
+# Reduced memory usage (was 600)
+scanner = MarketScanner(max_len=300)
+
 vwap_calculators = {inst: VWAPCalculator() for inst in INSTRUMENT_LIST}
 
 strategy_engine = StrategyEngine(scanner, vwap_calculators)
@@ -40,7 +45,10 @@ execution_engine = ExecutionEngine(
     trade_logger
 )
 
+
+# Track signals per day
 signals_today = {}
+
 ALLOW_NEW_TRADES = True
 
 
@@ -59,60 +67,91 @@ def start_market_streamer():
     )
 
     def on_message(message):
+
         global ALLOW_NEW_TRADES
 
         feeds = message.get("feeds", {})
         now = datetime.datetime.now()
         today = now.date().isoformat()
 
+        # Initialize today's signal store
         if today not in signals_today:
             signals_today[today] = set()
 
         current_prices = {}
 
         for inst_key, feed_info in feeds.items():
-            data = feed_info.get("fullFeed", {}).get("marketFF", {})
 
             try:
-                ltp = float(data["ltpc"]["ltp"])
-            except Exception:
-                continue
 
-            current_prices[inst_key] = ltp
+                data = feed_info.get("fullFeed", {}).get("marketFF", {})
 
-            ohlc = data.get("marketOHLC", {}).get("ohlc", [])
-            if not ohlc:
-                continue
-
-            bar = ohlc[-1]
-            try:
-                high = float(bar["high"])
-                low = float(bar["low"])
-                close = float(bar["close"])
-                volume = float(bar["vol"])
-            except Exception:
-                continue
-
-            # ---- Update Market State ----
-            scanner.update(inst_key, ltp, high, low, close, volume)
-
-            # ---- Strategy Evaluation ----
-            decision = strategy_engine.evaluate(inst_key, ltp)
-
-            if not decision:
-                continue
-
-            if decision.state.startswith("EXECUTE"):
-                if inst_key in signals_today[today]:
+                # ---------------- LTP ----------------
+                try:
+                    ltp = float(data["ltpc"]["ltp"])
+                except Exception:
                     continue
 
-                signals_today[today].add(inst_key)
-                execution_engine.handle_entry(inst_key, decision, ltp)
+                current_prices[inst_key] = ltp
 
-        # ---- Exit Handling ----
-        execution_engine.handle_exits(current_prices, now)
+                # ---------------- OHLC ----------------
+                ohlc = data.get("marketOHLC", {}).get("ohlc", [])
+
+                if not ohlc:
+                    continue
+
+                bar = ohlc[-1]
+
+                try:
+                    high = float(bar["high"])
+                    low = float(bar["low"])
+                    close = float(bar["close"])
+                    volume = float(bar["vol"])
+                except Exception:
+                    continue
+
+                # ---------------- Update Scanner ----------------
+                scanner.update(inst_key, ltp, high, low, close, volume)
+
+                # ---------------- Strategy Evaluation ----------------
+                decision = strategy_engine.evaluate(inst_key, ltp)
+
+                if not decision:
+                    continue
+
+                # ---------------- Entry Handling ----------------
+                if decision.state.startswith("EXECUTE"):
+
+                    # Separate LONG/SHORT tracking
+                    direction = decision.direction or "UNKNOWN"
+
+                    signal_key = (inst_key, direction)
+
+                    if signal_key in signals_today[today]:
+                        continue
+
+                    signals_today[today].add(signal_key)
+
+                    if ALLOW_NEW_TRADES:
+                        execution_engine.handle_entry(
+                            inst_key,
+                            decision,
+                            ltp
+                        )
+
+            except Exception as e:
+
+                print(f"[Market Stream Error] {inst_key}: {e}")
+                continue
+
+        # ---------------- Exit Handling ----------------
+        try:
+            execution_engine.handle_exits(current_prices, now)
+        except Exception as e:
+            print(f"[Exit Engine Error] {e}")
 
     streamer.on("message", on_message)
+
     streamer.connect()
 
-    print("🚀 Elite intraday trading system started (refactored & stable)")
+    print("🚀 Elite intraday trading system started (stable & optimized)")
