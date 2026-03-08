@@ -1,181 +1,169 @@
-# strategy/pullback_detector.py
+# strategy/strategy_engine.py
 
-from typing import Optional, Dict, List
-from strategy.sr_levels import compute_sr_levels, get_nearest_sr
-from strategy.volume_filter import analyze_volume
-from strategy.volatility_filter import compute_atr, analyze_volatility
-from strategy.price_action import rejection_info
+from strategy.market_regime import detect_market_regime
+from strategy.htf_bias import get_htf_bias
+from strategy.pullback_detector import detect_pullback_signal
+from strategy.decision_engine import final_trade_decision
+
+from strategy.vwap_filter import VWAPCalculator
+from strategy.mtf_builder import MTFBuilder
+from strategy.mtf_context import analyze_mtf
 
 
-def detect_pullback_signal(
-    prices: List[float],
-    highs: List[float],
-    lows: List[float],
-    closes: List[float],
-    volumes: List[float],
-    htf_direction: str,
-    max_proximity: float = 0.018,
-    min_bars: int = 35
-) -> Optional[Dict]:
+class StrategyEngine:
     """
-    PROFESSIONAL PULLBACK DETECTOR
+    PROFESSIONAL PULLBACK-BASED STRATEGY ENGINE
 
-    Purpose:
-    - Detect HIGH QUALITY mean reversion entries
-    - Avoid chasing extended moves
-    - Enter at smart locations
+    New Hierarchy:
 
-    CORE LOGIC:
-    LONG  -> price NEAR SUPPORT with confirmation
-    SHORT -> price NEAR RESISTANCE with confirmation
+    MTF → Regime → HTF → VWAP → PULLBACK DETECTION → Decision Engine
     """
 
-    if len(prices) < min_bars:
-        return None
+    def __init__(self, scanner, vwap_calculators):
+        self.scanner = scanner
+        self.vwap_calculators = vwap_calculators
+        self.mtf_builder = MTFBuilder()
 
-    last_price = closes[-1]
+    def evaluate(self, inst_key: str, ltp: float):
 
-    # --------------------------------------------------
-    # 1) STRUCTURAL LOCATION (WHERE ARE WE?)
-    # --------------------------------------------------
+        # ==================================================
+        # 1️⃣ DATA SUFFICIENCY
+        # ==================================================
 
-    sr = compute_sr_levels(highs, lows)
-    nearest = get_nearest_sr(last_price, sr, max_search_pct=max_proximity)
+        if not self.scanner.has_enough_data(inst_key, min_bars=40):
+            return None
 
-    if not nearest:
-        return None
+        prices = self.scanner.get_prices(inst_key)
+        highs = self.scanner.get_highs(inst_key)
+        lows = self.scanner.get_lows(inst_key)
+        closes = self.scanner.get_closes(inst_key)
+        volumes = self.scanner.get_volumes(inst_key)
 
-    # Direction intent from SR
-    trade_direction = None
+        if not (prices and highs and lows and closes and volumes):
+            return None
 
-    if nearest["type"] == "support" and htf_direction == "BULLISH":
-        trade_direction = "LONG"
+        # ==================================================
+        # 2️⃣ MULTI TIMEFRAME CONTEXT
+        # ==================================================
 
-    elif nearest["type"] == "resistance" and htf_direction == "BEARISH":
-        trade_direction = "SHORT"
+        last_bar = self.scanner.get_last_n_bars(inst_key, 1)
+        if not last_bar:
+            return None
 
-    else:
-        return None
+        bar = last_bar[0]
 
-    # --------------------------------------------------
-    # 2) EXTENSION FILTER (AVOID CHASING)
-    # --------------------------------------------------
+        self.mtf_builder.update(
+            inst_key,
+            bar["time"],
+            bar["open"],
+            bar["high"],
+            bar["low"],
+            bar["close"],
+            bar["volume"]
+        )
 
-    recent_move = abs(closes[-1] - closes[-6])
+        candle_5m = self.mtf_builder.get_latest_5m(inst_key)
+        hist_5m = self.mtf_builder.get_tf_history(inst_key, minutes=5, lookback=3)
 
-    atr = compute_atr(highs, lows, closes)
+        candle_15m = self.mtf_builder.get_latest_15m(inst_key)
+        hist_15m = self.mtf_builder.get_tf_history(inst_key, minutes=15, lookback=3)
 
-    if atr and recent_move > atr * 1.6:
-        return None  # too extended
+        mtf_ctx = analyze_mtf(
+            candle_5m,
+            candle_15m,
+            history_5m=hist_5m,
+            history_15m=hist_15m
+        )
 
-    # --------------------------------------------------
-    # 3) VOLATILITY QUALITY CHECK
-    # --------------------------------------------------
+        # HARD GATE: need clear HTF direction
+        if mtf_ctx.direction == "NEUTRAL":
+            return None
 
-    volat_ctx = analyze_volatility(
-        current_move=closes[-1] - closes[-2],
-        atr_value=atr
-    )
+        if mtf_ctx.conflict:
+            return None
 
-    if volat_ctx.state in ["CONTRACTING", "EXHAUSTION"]:
-        return None
+        # ==================================================
+        # 3️⃣ MARKET REGIME FILTER
+        # ==================================================
 
-    # --------------------------------------------------
-    # 4) PRICE ACTION CONFIRMATION
-    # --------------------------------------------------
+        regime = detect_market_regime(
+            highs=highs,
+            lows=lows,
+            closes=closes
+        )
 
-    last_bar_rejection = rejection_info(
-        closes[-2], highs[-1], lows[-1], closes[-1]
-    )
+        if regime.state in ("WEAK", "COMPRESSION"):
+            return None
 
-    price_reaction = False
+        # ==================================================
+        # 4️⃣ VWAP CONTEXT
+        # ==================================================
 
-    if trade_direction == "LONG" and last_bar_rejection["rejection_type"] == "BULLISH":
-        price_reaction = True
+        if inst_key not in self.vwap_calculators:
+            self.vwap_calculators[inst_key] = VWAPCalculator()
 
-    if trade_direction == "SHORT" and last_bar_rejection["rejection_type"] == "BEARISH":
-        price_reaction = True
+        vwap_calc = self.vwap_calculators[inst_key]
 
-    # Basic directional reaction
-    if trade_direction == "LONG" and closes[-1] > closes[-3]:
-        price_reaction = True
+        vwap_calc.update(
+            ltp,
+            volumes[-1] if volumes else 0
+        )
 
-    if trade_direction == "SHORT" and closes[-1] < closes[-3]:
-        price_reaction = True
+        vwap_ctx = vwap_calc.get_context(ltp)
 
-    # --------------------------------------------------
-    # 5) VOLUME CONFIRMATION
-    # --------------------------------------------------
+        # ==================================================
+        # 5️⃣ HTF BIAS
+        # ==================================================
 
-    vol_ctx = analyze_volume(volumes, close_prices=closes)
+        htf_bias = get_htf_bias(
+            prices=prices,
+            vwap_value=vwap_ctx.vwap
+        )
 
-    volume_ok = vol_ctx.score >= 0.6
+        # HTF must align with MTF
+        if mtf_ctx.direction == "BULLISH" and htf_bias.direction != "BULLISH":
+            return None
 
-    # --------------------------------------------------
-    # 6) MOMENTUM FILTER (DON’T BUY WEAK)
-    # --------------------------------------------------
+        if mtf_ctx.direction == "BEARISH" and htf_bias.direction != "BEARISH":
+            return None
 
-    short_term_trend = closes[-1] - closes[-5]
+        # ==================================================
+        # 6️⃣ PULLBACK DETECTION (CORE CHANGE)
+        # ==================================================
 
-    momentum_ok = False
+        pullback = detect_pullback_signal(
+            prices=prices,
+            highs=highs,
+            lows=lows,
+            closes=closes,
+            volumes=volumes,
+            htf_direction=mtf_ctx.direction
+        )
 
-    if trade_direction == "LONG" and short_term_trend > 0:
-        momentum_ok = True
+        if not pullback:
+            return None
 
-    if trade_direction == "SHORT" and short_term_trend < 0:
-        momentum_ok = True
+        # ==================================================
+        # 7️⃣ FINAL DECISION ENGINE
+        # ==================================================
 
-    # --------------------------------------------------
-    # 7) CONFIDENCE SCORING SYSTEM
-    # --------------------------------------------------
+        decision = final_trade_decision(
+            inst_key=inst_key,
+            prices=prices,
+            highs=highs,
+            lows=lows,
+            closes=closes,
+            volumes=volumes,
+            market_regime=regime.state,
+            htf_bias_direction=htf_bias.direction,
+            vwap_ctx=vwap_ctx,
+            pullback_signal=pullback
+        )
 
-    components = {
-        "location": 0.0,
-        "price_action": 0.0,
-        "volume": 0.0,
-        "volatility": 0.0,
-        "momentum": 0.0
-    }
+        # Add debugging context
+        decision.components["mtf_direction"] = mtf_ctx.direction
+        decision.components["mtf_strength"] = mtf_ctx.strength
+        decision.components["regime"] = regime.state
+        decision.components["htf_bias"] = htf_bias.label
 
-    # Location quality
-    proximity_score = max(0, (max_proximity - nearest["dist_pct"]) * 60)
-    components["location"] = min(proximity_score, 2.0)
-
-    if price_reaction:
-        components["price_action"] = 2.0
-
-    if volume_ok:
-        components["volume"] = 1.5
-
-    if volat_ctx.state == "EXPANDING":
-        components["volatility"] = 1.2
-
-    if momentum_ok:
-        components["momentum"] = 1.3
-
-    total_score = sum(components.values())
-
-    # --------------------------------------------------
-    # 8) CLASSIFICATION
-    # --------------------------------------------------
-
-    if total_score >= 5.0:
-        signal = "CONFIRMED"
-    elif total_score >= 3.0:
-        signal = "POTENTIAL"
-    else:
-        return None
-
-    return {
-        "signal": signal,
-        "direction": trade_direction,
-        "score": round(total_score, 2),
-        "nearest_level": nearest,
-        "components": components,
-        "context": {
-            "volatility": volat_ctx.state,
-            "volume": vol_ctx.strength,
-            "rejection": last_bar_rejection["rejection_type"]
-        },
-        "reason": f"{signal}_{trade_direction}"
-    }
+        return decision
